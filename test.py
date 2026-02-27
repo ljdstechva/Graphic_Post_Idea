@@ -1795,7 +1795,6 @@ class ClientMarkdownViewer(tk.Tk):
         self._apply_window_logo()
         self._configure_styles()
         self._build_ui()
-        maximize_window_on_start(self)
         self._ensure_test_script_for_editing()
         self.bind("<Left>", self._on_prev_post_key)
         self.bind("<Right>", self._on_next_post_key)
