@@ -1829,6 +1829,8 @@ class ClientMarkdownViewer(tk.Tk):
         self.current_file_path: Path | None = None
         self.current_posts: list[dict[str, object]] = []
         self.current_post_index = 0
+        self.last_rendered_fields_signature: tuple[object, ...] | None = None
+        self.last_rendered_field_message: str | None = None
         self.last_selected_client = ""
         self.field_value_vars: list[tk.StringVar] = []
         self.generation_process: subprocess.Popen[str] | None = None
@@ -1878,9 +1880,14 @@ class ClientMarkdownViewer(tk.Tk):
         self.client_search_var = tk.StringVar()
         self.client_search_results_listbox: tk.Listbox | None = None
         self.client_search_results_scrollbar: ttk.Scrollbar | None = None
+        self.client_search_results_popup: tk.Toplevel | None = None
         self.profile_autofill_in_progress = False
         self.auto_refresh_handle: str | None = None
         self.auto_refresh_interval_ms = 2000
+        self.refresh_idle_guard_seconds = 0.75
+        self.last_user_interaction_time = time.monotonic()
+        self.global_mousewheel_binding_ready = False
+        self.local_wheel_only_text_widgets: set[str] = set()
         self.last_md_signature = build_workspace_md_signature(self.base_dir)
         self.app_icon_image: tk.PhotoImage | None = None
         self.copy_feedback_toast: tk.Toplevel | None = None
@@ -1895,6 +1902,8 @@ class ClientMarkdownViewer(tk.Tk):
         self.bind("<Control-f>", lambda e: self.search_entry.focus_set())
         self.bind("<Control-d>", lambda e: self._toggle_theme())
         self.bind("<F5>", lambda e: self._refresh_from_workspace_if_changed())
+        self.bind("<Configure>", self._on_root_configure, add="+")
+        self._bind_global_interaction_tracking()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._run_startup_setup_if_needed()
         self.client_files = find_client_markdown_files(self.base_dir)
@@ -2134,6 +2143,12 @@ class ClientMarkdownViewer(tk.Tk):
         )
         self.search_entry.grid(row=1, column=0, sticky="w", pady=(4, 0))
         self.client_search_var.trace_add("write", self._on_client_search_changed)
+        self.search_entry.bind("<Down>", self._focus_client_search_results)
+        self.search_entry.bind("<Escape>", lambda _event: self._hide_client_search_results())
+        self.search_entry.bind(
+            "<FocusOut>",
+            lambda _event: self.after(50, self._hide_client_search_results_if_focus_lost),
+        )
 
         ttk.Label(client_group, text="SELECT", style="FieldName.TLabel").grid(row=0, column=1, sticky="w", padx=(10, 0))
         self.client_combo = ttk.Combobox(
@@ -2145,37 +2160,6 @@ class ClientMarkdownViewer(tk.Tk):
         )
         self.client_combo.grid(row=1, column=1, sticky="w", pady=(4, 0), padx=(10, 0))
         self.client_combo.bind("<<ComboboxSelected>>", self._on_client_selected)
-
-        self.client_search_results_listbox = tk.Listbox(
-            client_group,
-            exportselection=False,
-            activestyle="dotbox",
-            font=("Segoe UI", 10),
-            width=20,
-            height=6,
-            background=self.colors["surface"],
-            foreground=self.colors["text"],
-            selectbackground=self.colors["primary"],
-            selectforeground="#ffffff",
-            relief="flat",
-            borderwidth=0,
-            highlightthickness=1,
-            highlightbackground=self.colors["border"],
-        )
-        self.client_search_results_listbox.grid(row=2, column=0, sticky="ew", pady=(4, 0))
-        self.client_search_results_listbox.bind("<<ListboxSelect>>", self._on_client_search_result_selected)
-        self.client_search_results_listbox.bind("<Double-Button-1>", self._on_client_search_result_selected)
-        self.client_search_results_listbox.bind("<Return>", self._on_client_search_result_selected)
-
-        self.client_search_results_scrollbar = ttk.Scrollbar(
-            client_group,
-            orient="vertical",
-            command=self.client_search_results_listbox.yview,
-        )
-        self.client_search_results_scrollbar.grid(row=2, column=1, sticky="ns", pady=(4, 0))
-        self.client_search_results_listbox.configure(yscrollcommand=self.client_search_results_scrollbar.set)
-        self.client_search_results_listbox.grid_remove()
-        self.client_search_results_scrollbar.grid_remove()
 
         self.create_client_button = ttk.Button(
             controls,
@@ -2304,11 +2288,140 @@ class ClientMarkdownViewer(tk.Tk):
         self.fields_canvas.bind("<Configure>", lambda e: self.fields_canvas.itemconfigure(self.fields_window, width=e.width))
         self._bind_mousewheel(self.fields_canvas)
 
-    def _bind_mousewheel(self, widget: tk.Canvas) -> None:
-        def _on_mousewheel(event: tk.Event[tk.Misc]) -> None:
-            widget.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        
-        widget.bind_all("<MouseWheel>", _on_mousewheel)
+    def _bind_mousewheel(self, _widget: tk.Canvas) -> None:
+        # Keep the existing call sites, but route wheel handling through one global dispatcher.
+        if self.global_mousewheel_binding_ready:
+            return
+        self.bind_all("<MouseWheel>", self._on_global_mousewheel, add="+")
+        self.bind_all("<Button-4>", self._on_global_mousewheel, add="+")
+        self.bind_all("<Button-5>", self._on_global_mousewheel, add="+")
+        self.global_mousewheel_binding_ready = True
+
+    def _bind_text_scroll_redirect(self, text_widget: tk.Text) -> None:
+        text_widget.bind("<MouseWheel>", self._on_global_mousewheel, add="+")
+        text_widget.bind("<Button-4>", self._on_global_mousewheel, add="+")
+        text_widget.bind("<Button-5>", self._on_global_mousewheel, add="+")
+
+    def _register_local_wheel_only_text_widget(self, text_widget: tk.Text) -> None:
+        self.local_wheel_only_text_widgets.add(str(text_widget))
+
+    def _bind_global_interaction_tracking(self) -> None:
+        self.bind_all("<KeyPress>", self._mark_user_interaction, add="+")
+        self.bind_all("<ButtonPress>", self._mark_user_interaction, add="+")
+        self.bind_all("<MouseWheel>", self._mark_user_interaction, add="+")
+        self.bind_all("<ButtonPress>", self._hide_client_search_results_on_global_click, add="+")
+
+    def _mark_user_interaction(self, _event: tk.Event[tk.Misc]) -> None:
+        self.last_user_interaction_time = time.monotonic()
+
+    def _on_root_configure(self, _event: tk.Event[tk.Misc]) -> None:
+        if self._is_client_search_popup_visible():
+            self._position_client_search_results_popup()
+
+    def _on_global_mousewheel(self, event: tk.Event[tk.Misc]) -> str | None:
+        self._mark_user_interaction(event)
+        source_widget = self._get_mousewheel_source_widget(event)
+        if source_widget is None:
+            return None
+        if self._is_local_wheel_only_widget(source_widget):
+            # Let the Text widget keep wheel behavior local to itself.
+            return None
+        target = self._resolve_mousewheel_target(event, source_widget=source_widget)
+        if target is None:
+            return None
+        steps = self._normalize_mousewheel_steps(event)
+        if steps == 0:
+            return "break"
+        try:
+            target.yview_scroll(steps, "units")
+        except tk.TclError:
+            return None
+        return "break"
+
+    def _normalize_mousewheel_steps(self, event: tk.Event[tk.Misc]) -> int:
+        event_num = getattr(event, "num", None)
+        if event_num == 4:
+            return -1
+        if event_num == 5:
+            return 1
+
+        delta = getattr(event, "delta", 0)
+        if not isinstance(delta, (int, float)) or delta == 0:
+            return 0
+        # On Windows delta is usually +/-120; trackpad deltas can be smaller.
+        steps = int(delta / 120)
+        if steps == 0:
+            steps = 1 if delta > 0 else -1
+        return -steps
+
+    def _get_mousewheel_source_widget(self, event: tk.Event[tk.Misc]) -> tk.Misc | None:
+        source_widget = self.winfo_containing(event.x_root, event.y_root)
+        if source_widget is None and isinstance(event.widget, tk.Misc):
+            source_widget = event.widget
+        if source_widget is None or not isinstance(source_widget, tk.Misc):
+            return None
+        return source_widget
+
+    def _is_local_wheel_only_widget(self, widget: tk.Misc) -> bool:
+        current: tk.Misc | None = widget
+        while current is not None:
+            if str(current) in self.local_wheel_only_text_widgets:
+                return True
+            current = self._get_parent_widget(current)
+        return False
+
+    def _resolve_mousewheel_target(
+        self,
+        event: tk.Event[tk.Misc],
+        source_widget: tk.Misc | None = None,
+    ) -> tk.Misc | None:
+        if source_widget is None:
+            source_widget = self._get_mousewheel_source_widget(event)
+        if source_widget is None:
+            return None
+
+        fallback_scroll_widget: tk.Misc | None = None
+        fallback_text_widget: tk.Misc | None = None
+        current: tk.Misc | None = source_widget
+        while current is not None:
+            if isinstance(current, tk.Canvas) and self._widget_can_scroll_vertically(current):
+                return current
+
+            if self._widget_can_scroll_vertically(current):
+                if isinstance(current, tk.Text):
+                    if fallback_text_widget is None:
+                        fallback_text_widget = current
+                elif fallback_scroll_widget is None:
+                    fallback_scroll_widget = current
+
+            current = self._get_parent_widget(current)
+
+        return fallback_scroll_widget or fallback_text_widget
+
+    def _get_parent_widget(self, widget: tk.Misc) -> tk.Misc | None:
+        parent_name = widget.winfo_parent()
+        if not parent_name:
+            return None
+        try:
+            parent_widget = widget.nametowidget(parent_name)
+        except KeyError:
+            return None
+        return parent_widget if isinstance(parent_widget, tk.Misc) else None
+
+    def _widget_can_scroll_vertically(self, widget: tk.Misc) -> bool:
+        yview = getattr(widget, "yview", None)
+        if yview is None or not callable(yview):
+            return False
+        try:
+            first, last = yview()
+        except (tk.TclError, TypeError, ValueError):
+            return False
+        try:
+            first_value = float(first)
+            last_value = float(last)
+        except (TypeError, ValueError):
+            return False
+        return first_value > 0.0 or last_value < 1.0
 
     def _build_log_panel(self) -> None:
         log_panel = ttk.Frame(self, style="Content.TFrame", padding=(20, 0, 20, 20))
@@ -2361,6 +2474,7 @@ class ClientMarkdownViewer(tk.Tk):
             pady=10,
         )
         self.generation_log_text.grid(row=1, column=0, sticky="ew")
+        self._bind_text_scroll_redirect(self.generation_log_text)
         self._setup_log_tags()
 
     def _build_status_bar(self) -> None:
@@ -2399,8 +2513,12 @@ class ClientMarkdownViewer(tk.Tk):
                 foreground=self.colors["text"],
                 selectbackground=self.colors["primary"],
                 selectforeground="#ffffff",
-                highlightbackground=self.colors["border"],
             )
+        if (
+            self.client_search_results_popup is not None
+            and self.client_search_results_popup.winfo_exists()
+        ):
+            self.client_search_results_popup.configure(background=self.colors["border"])
         
         # Refresh settings window non-ttk widgets if open
         if self.settings_window is not None and self.settings_window.winfo_exists():
@@ -2430,30 +2548,181 @@ class ClientMarkdownViewer(tk.Tk):
         self._render_current_post() # Redraw fields with new colors
 
     def _hide_client_search_results(self) -> None:
-        if self.client_search_results_listbox is not None:
-            self.client_search_results_listbox.grid_remove()
-        if self.client_search_results_scrollbar is not None:
-            self.client_search_results_scrollbar.grid_remove()
+        if (
+            self.client_search_results_popup is not None
+            and self.client_search_results_popup.winfo_exists()
+        ):
+            self.client_search_results_popup.withdraw()
+
+    def _is_client_search_popup_visible(self) -> bool:
+        popup = self.client_search_results_popup
+        if popup is None or not popup.winfo_exists():
+            return False
+        try:
+            return popup.state() != "withdrawn"
+        except tk.TclError:
+            return False
+
+    def _is_widget_within(self, widget: tk.Misc, ancestor: tk.Misc) -> bool:
+        current: tk.Misc | None = widget
+        while current is not None:
+            if current is ancestor:
+                return True
+            current = self._get_parent_widget(current)
+        return False
+
+    def _hide_client_search_results_on_global_click(self, event: tk.Event[tk.Misc]) -> None:
+        if not self._is_client_search_popup_visible():
+            return
+        popup = self.client_search_results_popup
+        if popup is None or not popup.winfo_exists():
+            return
+        widget = event.widget
+        if not isinstance(widget, tk.Misc):
+            self._hide_client_search_results()
+            return
+        if self._is_widget_within(widget, self.search_entry):
+            return
+        if self._is_widget_within(widget, popup):
+            return
+        self._hide_client_search_results()
+
+    def _hide_client_search_results_if_focus_lost(self) -> None:
+        if not self._is_client_search_popup_visible():
+            return
+        focus_widget = self.focus_get()
+        if not isinstance(focus_widget, tk.Misc):
+            self._hide_client_search_results()
+            return
+        popup = self.client_search_results_popup
+        if popup is None or not popup.winfo_exists():
+            self._hide_client_search_results()
+            return
+        if self._is_widget_within(focus_widget, self.search_entry):
+            return
+        if self._is_widget_within(focus_widget, popup):
+            return
+        self._hide_client_search_results()
+
+    def _focus_client_search_results(self, _event: tk.Event[tk.Misc]) -> str | None:
+        if (
+            not self._is_client_search_popup_visible()
+            or self.client_search_results_listbox is None
+            or self.client_search_results_listbox.size() == 0
+        ):
+            return None
+        listbox = self.client_search_results_listbox
+        target_index = listbox.curselection()[0] if listbox.curselection() else 0
+        listbox.activate(target_index)
+        listbox.see(target_index)
+        listbox.focus_set()
+        return "break"
+
+    def _ensure_client_search_results_popup(self) -> bool:
+        if (
+            self.client_search_results_popup is not None
+            and self.client_search_results_popup.winfo_exists()
+            and self.client_search_results_listbox is not None
+            and self.client_search_results_scrollbar is not None
+        ):
+            return True
+
+        try:
+            popup = tk.Toplevel(self)
+            popup.withdraw()
+            popup.overrideredirect(True)
+            popup.transient(self)
+            popup.configure(background=self.colors["border"], padx=1, pady=1)
+            popup.columnconfigure(0, weight=1)
+            popup.rowconfigure(0, weight=1)
+
+            listbox = tk.Listbox(
+                popup,
+                exportselection=False,
+                activestyle="dotbox",
+                font=("Segoe UI", 10),
+                width=20,
+                height=6,
+                background=self.colors["surface"],
+                foreground=self.colors["text"],
+                selectbackground=self.colors["primary"],
+                selectforeground="#ffffff",
+                relief="flat",
+                borderwidth=0,
+                highlightthickness=0,
+            )
+            listbox.grid(row=0, column=0, sticky="nsew")
+            listbox.bind("<<ListboxSelect>>", self._on_client_search_result_selected)
+            listbox.bind("<Double-Button-1>", self._on_client_search_result_selected)
+            listbox.bind("<Return>", self._on_client_search_result_selected)
+            listbox.bind("<Escape>", lambda _event: self._hide_client_search_results())
+            listbox.bind(
+                "<FocusOut>",
+                lambda _event: self.after(50, self._hide_client_search_results_if_focus_lost),
+            )
+
+            scrollbar = ttk.Scrollbar(
+                popup,
+                orient="vertical",
+                command=listbox.yview,
+            )
+            scrollbar.grid(row=0, column=1, sticky="ns")
+            listbox.configure(yscrollcommand=scrollbar.set)
+
+            self.client_search_results_popup = popup
+            self.client_search_results_listbox = listbox
+            self.client_search_results_scrollbar = scrollbar
+            return True
+        except tk.TclError:
+            self.client_search_results_popup = None
+            self.client_search_results_listbox = None
+            self.client_search_results_scrollbar = None
+            return False
+
+    def _position_client_search_results_popup(self) -> None:
+        if (
+            self.client_search_results_popup is None
+            or not self.client_search_results_popup.winfo_exists()
+            or self.client_search_results_listbox is None
+        ):
+            return
+        self.update_idletasks()
+        popup = self.client_search_results_popup
+        x_pos = self.search_entry.winfo_rootx()
+        y_pos = self.search_entry.winfo_rooty() + self.search_entry.winfo_height() + 2
+        width = max(180, self.search_entry.winfo_width())
+        if (
+            self.client_search_results_scrollbar is not None
+            and self.client_search_results_scrollbar.winfo_manager()
+        ):
+            width += self.client_search_results_scrollbar.winfo_reqwidth()
+        height = self.client_search_results_listbox.winfo_reqheight() + 2
+        popup.geometry(f"{width}x{height}+{x_pos}+{y_pos}")
 
     def _show_client_search_results(self, client_names: list[str]) -> None:
+        if not client_names:
+            self._hide_client_search_results()
+            return
+        if not self._ensure_client_search_results_popup():
+            return
         if self.client_search_results_listbox is None:
             return
+
         self.client_search_results_listbox.delete(0, "end")
         for client_name in client_names:
             self.client_search_results_listbox.insert("end", client_name)
 
-        if not client_names:
-            self._hide_client_search_results()
-            return
-
         visible_rows = min(max(len(client_names), 1), 6)
         self.client_search_results_listbox.configure(height=visible_rows)
-        self.client_search_results_listbox.grid()
         if self.client_search_results_scrollbar is not None:
             if len(client_names) > visible_rows:
                 self.client_search_results_scrollbar.grid()
             else:
                 self.client_search_results_scrollbar.grid_remove()
+        if self.client_search_results_popup is not None and self.client_search_results_popup.winfo_exists():
+            self._position_client_search_results_popup()
+            self.client_search_results_popup.deiconify()
+            self.client_search_results_popup.lift()
 
     def _on_client_search_result_selected(self, _event: tk.Event[tk.Misc]) -> None:
         if self.client_search_results_listbox is None:
@@ -3061,6 +3330,7 @@ class ClientMarkdownViewer(tk.Tk):
             )
 
     def _on_client_selected(self, _event: tk.Event[tk.Misc]) -> None:
+        self._hide_client_search_results()
         client_name = self.client_var.get().strip()
         if not client_name:
             return
@@ -3148,11 +3418,21 @@ class ClientMarkdownViewer(tk.Tk):
             self.regenerate_button.configure(state="normal" if (self.current_posts and not is_generating) else "disabled")
 
     def _render_post_fields(self, post: dict[str, object]) -> None:
-        self._clear_field_rows()
         fields = build_post_display_fields(post)
         if not fields:
             self._render_field_message("No fields found for this post.")
             return
+        file_signature = str(self.current_file_path) if self.current_file_path is not None else ""
+        fields_signature = (
+            self.theme_var.get(),
+            file_signature,
+            self.current_post_index,
+            tuple(fields),
+        )
+        if self.last_rendered_fields_signature == fields_signature:
+            return
+
+        self._clear_field_rows()
 
         for row_index, (field_name, field_value) in enumerate(fields):
             is_optional_item = field_name.startswith("Optional List ")
@@ -3205,6 +3485,7 @@ class ClientMarkdownViewer(tk.Tk):
                 value_text.insert("1.0", field_value)
                 value_text.configure(state="disabled")
                 value_text.grid(row=0, column=1, sticky="ew", pady=4)
+                self._bind_text_scroll_redirect(value_text)
                 value_text.bind(
                     "<Button-1>",
                     lambda event, field_name=field_name, field_value=field_value: self._on_value_field_clicked(
@@ -3257,10 +3538,16 @@ class ClientMarkdownViewer(tk.Tk):
                 padx=(10, 0),
                 pady=4,
             )
+        self.last_rendered_fields_signature = fields_signature
+        self.last_rendered_field_message = None
 
     def _render_field_message(self, message: str) -> None:
+        if self.last_rendered_field_message == message:
+            return
         self._clear_field_rows()
         ttk.Label(self.fields_rows_frame, text=message, style="FieldValue.TLabel").grid(row=0, column=0, sticky="w")
+        self.last_rendered_fields_signature = None
+        self.last_rendered_field_message = message
 
     def _clear_field_rows(self) -> None:
         self.field_value_vars.clear()
@@ -3975,6 +4262,7 @@ class ClientMarkdownViewer(tk.Tk):
 
     def _poll_generation_events(self) -> None:
         self.generation_poll_handle = None
+        pending_log_lines: list[str] = []
         while True:
             try:
                 event_type, payload = self.generation_log_queue.get_nowait()
@@ -3984,7 +4272,7 @@ class ClientMarkdownViewer(tk.Tk):
             if event_type == "line":
                 display_line = self._format_generation_log_line(payload)
                 if display_line:
-                    self._append_generation_log(display_line)
+                    pending_log_lines.append(display_line)
                 context_percent = extract_context_left_percent_from_line(payload)
                 if context_percent is not None:
                     self.context_left_var.set(f"Context left: {context_percent}%")
@@ -4036,6 +4324,9 @@ class ClientMarkdownViewer(tk.Tk):
                 self.model_status_in_progress = False
                 self.status_var.set("Model status updated.")
                 self._sync_model_status_button_state()
+
+        if pending_log_lines:
+            self._append_generation_logs_batch(pending_log_lines)
 
         if should_continue_generation_polling(
             generation_running=is_generation_process_running(self.generation_process),
@@ -4213,20 +4504,35 @@ class ClientMarkdownViewer(tk.Tk):
         if not line.strip():
             return
         self.generation_log_text.configure(state="normal")
-        
-        tag = None
-        lower_line = line.lower()
-        if "[error]" in lower_line or "failed" in lower_line:
-            tag = "error"
-        elif "[status]" in lower_line:
-            tag = "status"
-        elif "[system]" in lower_line:
-            tag = "system"
-        elif "[model]" in lower_line:
-            tag = "model"
-            
+        tag = self._resolve_generation_log_tag(line)
         self.generation_log_text.insert("end", f"{line}\n", tag)
         self.generation_log_text.see("end")
+        self.generation_log_text.configure(state="disabled")
+
+    def _resolve_generation_log_tag(self, line: str) -> str | None:
+        lower_line = line.lower()
+        if "[error]" in lower_line or "failed" in lower_line:
+            return "error"
+        if "[status]" in lower_line:
+            return "status"
+        if "[system]" in lower_line:
+            return "system"
+        if "[model]" in lower_line:
+            return "model"
+        return None
+
+    def _append_generation_logs_batch(self, lines: list[str]) -> None:
+        if not lines:
+            return
+        self.generation_log_text.configure(state="normal")
+        appended_any = False
+        for line in lines:
+            if not line.strip():
+                continue
+            self.generation_log_text.insert("end", f"{line}\n", self._resolve_generation_log_tag(line))
+            appended_any = True
+        if appended_any:
+            self.generation_log_text.see("end")
         self.generation_log_text.configure(state="disabled")
 
     def _clear_generation_logs(self) -> None:
@@ -4345,6 +4651,7 @@ class ClientMarkdownViewer(tk.Tk):
             highlightbackground=self.colors["border"],
         )
         self.settings_content_text.grid(row=1, column=0, sticky="nsew")
+        self._bind_text_scroll_redirect(self.settings_content_text)
         self.settings_content_text.bind("<<Modified>>", self._on_settings_editor_modified)
 
         self.settings_content_scrollbar = ttk.Scrollbar(
@@ -4458,6 +4765,7 @@ class ClientMarkdownViewer(tk.Tk):
                 highlightbackground=self.colors["border"],
             )
             field_text.grid(row=row, column=1, sticky="ew", pady=(0, 8))
+            self._register_local_wheel_only_text_widget(field_text)
             field_text.bind("<<Modified>>", self._on_caption_samples_field_modified)
             self.settings_caption_field_texts[field] = field_text
 
@@ -4536,6 +4844,7 @@ class ClientMarkdownViewer(tk.Tk):
         self._is_loading_caption_fields = False
         self.settings_editor_dirty = False
         self.profile_autofill_in_progress = False
+        self.local_wheel_only_text_widgets.clear()
 
     def _set_settings_mode(self, mode: str) -> None:
         if mode not in {"general", "client"}:
@@ -4664,6 +4973,7 @@ class ClientMarkdownViewer(tk.Tk):
             highlightbackground=self.colors["border"],
         )
         info_text.grid(row=1, column=0, sticky="nsew")
+        self._bind_text_scroll_redirect(info_text)
 
         info_scroll = ttk.Scrollbar(text_frame, orient="vertical", command=info_text.yview)
         info_scroll.grid(row=1, column=1, sticky="ns")
@@ -5307,7 +5617,9 @@ class ClientMarkdownViewer(tk.Tk):
 
     def _auto_refresh_tick(self) -> None:
         self.auto_refresh_handle = None
-        self._refresh_from_workspace_if_changed()
+        idle_time_seconds = time.monotonic() - self.last_user_interaction_time
+        if idle_time_seconds >= self.refresh_idle_guard_seconds:
+            self._refresh_from_workspace_if_changed()
         self._schedule_auto_refresh()
 
     def _refresh_from_workspace_if_changed(self) -> None:
@@ -5377,6 +5689,15 @@ class ClientMarkdownViewer(tk.Tk):
         if self.copy_feedback_toast is not None and self.copy_feedback_toast.winfo_exists():
             self.copy_feedback_toast.destroy()
             self.copy_feedback_toast = None
+
+        if (
+            self.client_search_results_popup is not None
+            and self.client_search_results_popup.winfo_exists()
+        ):
+            self.client_search_results_popup.destroy()
+        self.client_search_results_popup = None
+        self.client_search_results_listbox = None
+        self.client_search_results_scrollbar = None
 
         self.destroy()
 
