@@ -32,9 +32,11 @@ SOURCE_SCRIPT_FILENAME = "test.py"
 TEST_SCRIPT_FILENAME = "test.py"
 SMARCOMMS_FILENAME = "SMARCOMMS.md"
 REGENERATE_FILENAME = "REGENERATE.md"
+CLIENT_PROFILE_AUTOFILL_FILENAME = "CLIENT_PROFILE_AUTOFILL.md"
 AGENTS_CONTROL_FILENAMES = {"AGENTS.md", "AGENTS.override.md"}
 AGENTS_RUNBOOK_LABEL = f"{AGENTS_DIRNAME}/{SMARCOMMS_FILENAME}"
 AGENTS_REGENERATE_LABEL = f"{AGENTS_DIRNAME}/{REGENERATE_FILENAME}"
+AGENTS_CLIENT_PROFILE_AUTOFILL_LABEL = f"{AGENTS_DIRNAME}/{CLIENT_PROFILE_AUTOFILL_FILENAME}"
 CAPTION_SAMPLES_FILENAME = "CAPTION_SAMPLES.md"
 CAPTION_SAMPLE_MINIMUM_COUNT = 5
 APP_LOGO_FILENAME = "graphic_post_logo.png"
@@ -203,6 +205,33 @@ Post # - Type of Post
 - Pass 5: Source check for website, product/service, phone, and email accuracy.
 - Self-score quality from 0-100.
 - If score is below 100, revise and rerun checks until 100.
+"""
+
+DEFAULT_CLIENT_PROFILE_AUTOFILL_CONTENT = """# Client Profile Auto-Fill Runbook
+
+## Scope
+- Root workspace is where this runbook exists.
+- Only perform CRUD inside this workspace and subfolders.
+- Update only the selected `Clients/[Client Name]/CLIENT_PROFILE.md`.
+- Do not modify any other file.
+
+## Required Skill
+- Use `$content-creator` if available in the runtime.
+- Apply it to keep profile writing factual and brand-aware.
+
+## Source Constraints
+- If a website URL is provided:
+  - Only use that website and pages linked from it.
+  - Do not use search engines or external websites.
+- If no website URL is provided:
+  - Use only the exact pasted client information.
+- Never invent facts or fill unknown values with guesses.
+
+## Editing Rules
+- Keep all field names and order exactly as-is in `CLIENT_PROFILE.md`.
+- Fill only values supported by allowed sources.
+- If a field has no supported information, leave it blank.
+- Preserve markdown format with `Field: Value` or blank value.
 """
 
 POST_METADATA_FIELDS = {"Post Number", "Post Header"}
@@ -507,6 +536,18 @@ def get_general_agents_root(base_dir: Path) -> Path:
 
 def get_smarcomms_runbook_path(base_dir: Path) -> Path:
     return get_general_agents_root(base_dir) / SMARCOMMS_FILENAME
+
+
+def get_client_profile_autofill_instruction_path(base_dir: Path) -> Path:
+    return get_general_agents_root(base_dir) / CLIENT_PROFILE_AUTOFILL_FILENAME
+
+
+def ensure_client_profile_autofill_instruction(base_dir: Path) -> Path:
+    instruction_path = get_client_profile_autofill_instruction_path(base_dir)
+    instruction_path.parent.mkdir(parents=True, exist_ok=True)
+    if not instruction_path.exists():
+        instruction_path.write_text(DEFAULT_CLIENT_PROFILE_AUTOFILL_CONTENT, encoding="utf-8")
+    return instruction_path
 
 
 def sync_legacy_general_agents_into_agents(base_dir: Path) -> list[Path]:
@@ -854,6 +895,56 @@ def build_generation_prompt(
         f"{runbook_text}\n"
         "END SMARCOMMS.md\n"
     )
+
+
+def build_client_profile_autofill_prompt(
+    *,
+    client_name: str,
+    profile_relative_path: str,
+    website_url: str,
+    pasted_information: str,
+    runbook_text: str,
+) -> str:
+    normalized_client_name = normalize_client_name(client_name)
+    normalized_website_url = website_url.strip()
+    normalized_pasted_information = pasted_information.strip()
+    source_mode = "website" if normalized_website_url else "pasted information only"
+    website_block = normalized_website_url if normalized_website_url else "None provided"
+    pasted_block = normalized_pasted_information if normalized_pasted_information else "None provided"
+    profile_fields_block = "\n".join(f"- {field}" for field in CLIENT_PROFILE_FIELDS)
+
+    return f"""You are updating one client profile markdown file.
+
+Follow this runbook exactly:
+BEGIN {CLIENT_PROFILE_AUTOFILL_FILENAME}
+{runbook_text}
+END {CLIENT_PROFILE_AUTOFILL_FILENAME}
+
+Task:
+- Client Name: {normalized_client_name}
+- Target file to edit in-place: {profile_relative_path}
+- Source mode: {source_mode}
+
+Allowed source input:
+- Website URL: {website_block}
+- Pasted Client Information:
+{pasted_block}
+
+Hard constraints:
+- Use `$content-creator` skill if available.
+- If website URL is provided, only use that website and links inside it as sources.
+- If website URL is not provided, only use the pasted client information.
+- Do not use any outside source.
+- Do not invent or infer unsupported details.
+- If a field has no supported data, leave its value blank.
+- Keep field names and order exactly unchanged.
+- Keep all edits limited to the target file only.
+
+Client profile fields that must remain present and ordered:
+{profile_fields_block}
+
+Save the file and return a short confirmation only.
+"""
 
 
 def resolve_model_selection_feedback(
@@ -1761,6 +1852,7 @@ class ClientMarkdownViewer(tk.Tk):
         self.settings_content_text: tk.Text | None = None
         self.save_settings_button: ttk.Button | None = None
         self.reload_settings_button: ttk.Button | None = None
+        self.auto_fill_profile_button: ttk.Button | None = None
         self.settings_general_mode_button: ttk.Button | None = None
         self.settings_client_mode_button: ttk.Button | None = None
         self.open_general_settings_button: ttk.Button | None = None
@@ -1786,6 +1878,7 @@ class ClientMarkdownViewer(tk.Tk):
         self.client_search_var = tk.StringVar()
         self.client_search_results_listbox: tk.Listbox | None = None
         self.client_search_results_scrollbar: ttk.Scrollbar | None = None
+        self.profile_autofill_in_progress = False
         self.auto_refresh_handle: str | None = None
         self.auto_refresh_interval_ms = 2000
         self.last_md_signature = build_workspace_md_signature(self.base_dir)
@@ -2460,6 +2553,16 @@ class ClientMarkdownViewer(tk.Tk):
                 f"[setup] Failed to initialize {AGENTS_DIRNAME}/ from legacy files: {error}"
             )
 
+        try:
+            profile_instruction_path = ensure_client_profile_autofill_instruction(self.base_dir)
+            self._append_generation_log(
+                f"[setup] Ensured client profile auto-fill runbook: {profile_instruction_path}"
+            )
+        except OSError as error:
+            self._append_generation_log(
+                f"[setup] Failed to ensure client profile auto-fill runbook: {error}"
+            )
+
         node_runtime_missing = notify_nodejs_install_if_missing(parent=self)
         if node_runtime_missing:
             self.status_var.set(
@@ -2513,6 +2616,9 @@ class ClientMarkdownViewer(tk.Tk):
         runbook_path = get_smarcomms_runbook_path(self.base_dir)
         if not runbook_path.is_file():
             missing.append(AGENTS_RUNBOOK_LABEL)
+        profile_autofill_runbook_path = get_client_profile_autofill_instruction_path(self.base_dir)
+        if not profile_autofill_runbook_path.is_file():
+            missing.append(AGENTS_CLIENT_PROFILE_AUTOFILL_LABEL)
 
         skills_root = Path.home() / ".codex" / "skills"
         if not skills_root.exists():
@@ -2582,6 +2688,14 @@ class ClientMarkdownViewer(tk.Tk):
                 )
             else:
                 add_report(f"Created file from fallback template: {runbook_path}")
+
+        profile_autofill_path = get_client_profile_autofill_instruction_path(self.base_dir)
+        if AGENTS_CLIENT_PROFILE_AUTOFILL_LABEL in missing_items and not profile_autofill_path.is_file():
+            profile_autofill_path.write_text(
+                DEFAULT_CLIENT_PROFILE_AUTOFILL_CONTENT,
+                encoding="utf-8",
+            )
+            add_report(f"Created file from template: {profile_autofill_path}")
 
         skills_root = Path.home() / ".codex" / "skills"
         if "Codex skills directory (~/.codex/skills)" in missing_items:
@@ -2695,6 +2809,7 @@ class ClientMarkdownViewer(tk.Tk):
         self,
         command: list[str],
         timeout_seconds: int = 180,
+        input_text: str | None = None,
     ) -> tuple[bool, str]:
         creation_flags = 0
         if hasattr(subprocess, "CREATE_NO_WINDOW"):
@@ -2704,6 +2819,7 @@ class ClientMarkdownViewer(tk.Tk):
             completed = subprocess.run(
                 command,
                 cwd=self.base_dir,
+                input=input_text,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -4352,7 +4468,15 @@ class ClientMarkdownViewer(tk.Tk):
 
         actions = ttk.Frame(window, padding=(12, 0, 12, 12))
         actions.grid(row=3, column=0, sticky="ew")
-        actions.columnconfigure(2, weight=1)
+        actions.columnconfigure(3, weight=1)
+
+        self.auto_fill_profile_button = ttk.Button(
+            actions,
+            text="Auto Fill Info",
+            command=self._on_auto_fill_profile_clicked,
+        )
+        self.auto_fill_profile_button.grid(row=0, column=0, sticky="w")
+        self.auto_fill_profile_button.grid_remove()
 
         self.save_settings_button = ttk.Button(
             actions,
@@ -4360,7 +4484,7 @@ class ClientMarkdownViewer(tk.Tk):
             command=self._save_settings_file,
             state="disabled",
         )
-        self.save_settings_button.grid(row=0, column=0, sticky="w")
+        self.save_settings_button.grid(row=0, column=1, sticky="w", padx=(8, 0))
 
         self.reload_settings_button = ttk.Button(
             actions,
@@ -4368,10 +4492,10 @@ class ClientMarkdownViewer(tk.Tk):
             command=self._reload_settings_file,
             state="disabled",
         )
-        self.reload_settings_button.grid(row=0, column=1, sticky="w", padx=(8, 0))
+        self.reload_settings_button.grid(row=0, column=2, sticky="w", padx=(8, 0))
 
         ttk.Label(actions, textvariable=self.settings_status_var, style="SettingsInfo.TLabel").grid(
-            row=0, column=2, sticky="e"
+            row=0, column=3, sticky="e"
         )
 
         self._set_settings_mode(mode)
@@ -4401,6 +4525,7 @@ class ClientMarkdownViewer(tk.Tk):
         self.settings_caption_field_texts = {}
         self.save_settings_button = None
         self.reload_settings_button = None
+        self.auto_fill_profile_button = None
         self.settings_general_mode_button = None
         self.settings_client_mode_button = None
         self.settings_file_lookup = {}
@@ -4410,6 +4535,7 @@ class ClientMarkdownViewer(tk.Tk):
         self._is_loading_profile_fields = False
         self._is_loading_caption_fields = False
         self.settings_editor_dirty = False
+        self.profile_autofill_in_progress = False
 
     def _set_settings_mode(self, mode: str) -> None:
         if mode not in {"general", "client"}:
@@ -4457,6 +4583,295 @@ class ClientMarkdownViewer(tk.Tk):
             self.settings_client_mode_button.configure(
                 state="disabled" if self.settings_mode_var.get() == "client" else "normal"
             )
+
+    def _is_client_profile_selected(self) -> bool:
+        path = self.current_settings_file_path
+        return path is not None and path.name.lower() == "client_profile.md"
+
+    def _sync_auto_fill_profile_button(self) -> None:
+        if self.auto_fill_profile_button is None:
+            return
+        if not self._is_client_profile_selected():
+            self.auto_fill_profile_button.grid_remove()
+            return
+
+        self.auto_fill_profile_button.grid()
+        self.auto_fill_profile_button.configure(
+            state="disabled" if self.profile_autofill_in_progress else "normal"
+        )
+
+    def _prompt_profile_auto_fill_inputs(
+        self,
+        *,
+        default_website: str = "",
+    ) -> tuple[str, str] | None:
+        owner: tk.Misc = self.settings_window if self.settings_window is not None else self
+        dialog = tk.Toplevel(owner)
+        dialog.title("Auto Fill Client Profile")
+        dialog.geometry("760x440")
+        dialog.minsize(680, 380)
+        dialog.configure(background=self.colors["bg"])
+        dialog.transient(owner)
+        dialog.grab_set()
+        dialog.columnconfigure(0, weight=1)
+        dialog.rowconfigure(1, weight=1)
+
+        website_var = tk.StringVar(value=default_website.strip())
+        result: dict[str, tuple[str, str] | None] = {"value": None}
+
+        container = ttk.Frame(dialog, padding=(14, 14, 14, 8))
+        container.grid(row=0, column=0, sticky="nsew")
+        container.columnconfigure(0, weight=1)
+
+        ttk.Label(
+            container,
+            text="Provide website and/or pasted client information.",
+            style="SettingsInfo.TLabel",
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            container,
+            text="Website URL (optional)",
+            style="FieldName.TLabel",
+        ).grid(row=1, column=0, sticky="w", pady=(10, 4))
+        website_entry = ttk.Entry(container, textvariable=website_var)
+        website_entry.grid(row=2, column=0, sticky="ew")
+
+        text_frame = ttk.Frame(dialog, padding=(14, 0, 14, 10))
+        text_frame.grid(row=1, column=0, sticky="nsew")
+        text_frame.columnconfigure(0, weight=1)
+        text_frame.rowconfigure(1, weight=1)
+
+        ttk.Label(
+            text_frame,
+            text="Pasted client information (optional)",
+            style="FieldName.TLabel",
+        ).grid(row=0, column=0, sticky="w", pady=(0, 4))
+        info_text = tk.Text(
+            text_frame,
+            wrap="word",
+            height=12,
+            font=("Segoe UI", 10),
+            background=self.colors["surface"],
+            foreground=self.colors["text"],
+            insertbackground=self.colors["primary"],
+            selectbackground=self.colors["primary"],
+            selectforeground="#ffffff",
+            relief="flat",
+            borderwidth=0,
+            padx=10,
+            pady=10,
+            highlightthickness=1,
+            highlightbackground=self.colors["border"],
+        )
+        info_text.grid(row=1, column=0, sticky="nsew")
+
+        info_scroll = ttk.Scrollbar(text_frame, orient="vertical", command=info_text.yview)
+        info_scroll.grid(row=1, column=1, sticky="ns")
+        info_text.configure(yscrollcommand=info_scroll.set)
+
+        buttons = ttk.Frame(dialog, padding=(14, 0, 14, 14))
+        buttons.grid(row=2, column=0, sticky="ew")
+        buttons.columnconfigure(0, weight=1)
+
+        run_button: ttk.Button | None = None
+
+        def has_any_input() -> bool:
+            website_text = website_var.get().strip()
+            pasted_text = info_text.get("1.0", "end-1c").strip()
+            return bool(website_text or pasted_text)
+
+        def update_submit_state(*_args: object) -> None:
+            if run_button is None:
+                return
+            run_button.configure(state="normal" if has_any_input() else "disabled")
+
+        def submit() -> None:
+            website_text = website_var.get().strip()
+            pasted_text = info_text.get("1.0", "end-1c").strip()
+            if not website_text and not pasted_text:
+                messagebox.showwarning(
+                    "Missing Input",
+                    "Provide at least a website URL or pasted client information.",
+                    parent=dialog,
+                )
+                return
+            result["value"] = (website_text, pasted_text)
+            dialog.destroy()
+
+        ttk.Button(buttons, text="Cancel", command=dialog.destroy).grid(row=0, column=1, sticky="e")
+        run_button = ttk.Button(
+            buttons,
+            text="Run Auto Fill",
+            style="Accent.TButton",
+            command=submit,
+            state="disabled",
+        )
+        run_button.grid(
+            row=0, column=2, sticky="e", padx=(8, 0)
+        )
+
+        website_var.trace_add("write", update_submit_state)
+        info_text.bind("<KeyRelease>", update_submit_state)
+        info_text.bind("<<Paste>>", lambda _event: dialog.after_idle(update_submit_state))
+        info_text.bind("<<Cut>>", lambda _event: dialog.after_idle(update_submit_state))
+        update_submit_state()
+
+        website_entry.focus_set()
+        self.wait_window(dialog)
+        return result["value"]
+
+    def _resolve_latest_codex_model_for_profile_autofill(self, codex_executable: str) -> str:
+        fallback = self.selected_codex_model.strip() or DEFAULT_CODEX_MODEL
+        try:
+            catalog = fetch_codex_model_catalog(codex_executable, base_dir=self.base_dir)
+        except Exception:
+            return fallback
+        if not catalog:
+            return fallback
+
+        default_entry = next(
+            (entry for entry in catalog if isinstance(entry, dict) and bool(entry.get("is_default"))),
+            None,
+        )
+        if default_entry is not None:
+            model_value = default_entry.get("model")
+            if isinstance(model_value, str) and model_value.strip():
+                return model_value.strip()
+
+        first_entry = catalog[0]
+        if isinstance(first_entry, dict):
+            model_value = first_entry.get("model")
+            if isinstance(model_value, str) and model_value.strip():
+                return model_value.strip()
+        return fallback
+
+    def _on_auto_fill_profile_clicked(self) -> None:
+        if self.profile_autofill_in_progress:
+            return
+        if not self._is_client_profile_selected() or self.current_settings_file_path is None:
+            return
+
+        if self.settings_editor_dirty:
+            action = messagebox.askyesnocancel(
+                "Unsaved Changes",
+                "You have unsaved profile edits.\n\nSave first before auto fill?",
+                parent=self.settings_window,
+            )
+            if action is None:
+                return
+            if action:
+                self._save_settings_file()
+                if self.settings_editor_dirty:
+                    return
+
+        profile_path = self.current_settings_file_path
+        default_website = ""
+        try:
+            current_values = parse_client_profile_markdown(
+                profile_path.read_text(encoding="utf-8", errors="replace"),
+                self.client_var.get().strip() or profile_path.parent.name,
+            )
+            default_website = current_values.get("Website", "")
+        except OSError:
+            default_website = ""
+
+        prompt_inputs = self._prompt_profile_auto_fill_inputs(default_website=default_website)
+        if prompt_inputs is None:
+            return
+        website_url, pasted_information = prompt_inputs
+
+        self.profile_autofill_in_progress = True
+        self._sync_auto_fill_profile_button()
+        if self.reload_settings_button is not None:
+            self.reload_settings_button.configure(state="disabled")
+        if self.save_settings_button is not None:
+            self.save_settings_button.configure(state="disabled")
+        self.settings_status_var.set("Auto filling CLIENT_PROFILE.md via Codex...")
+        self.status_var.set("Running profile auto fill...")
+
+        thread = threading.Thread(
+            target=self._run_profile_autofill_worker,
+            args=(profile_path, website_url, pasted_information),
+            daemon=True,
+        )
+        thread.start()
+
+    def _run_profile_autofill_worker(
+        self,
+        profile_path: Path,
+        website_url: str,
+        pasted_information: str,
+    ) -> None:
+        success = False
+        message = ""
+        try:
+            codex_executable = self._resolve_codex_executable()
+            if codex_executable is None:
+                raise RuntimeError("Codex CLI is unavailable.")
+
+            runbook_path = ensure_client_profile_autofill_instruction(self.base_dir)
+            runbook_text = runbook_path.read_text(encoding="utf-8", errors="replace")
+            model_name = self._resolve_latest_codex_model_for_profile_autofill(codex_executable)
+            prompt = build_client_profile_autofill_prompt(
+                client_name=self.client_var.get().strip() or profile_path.parent.name,
+                profile_relative_path=self._to_relative_path(profile_path),
+                website_url=website_url,
+                pasted_information=pasted_information,
+                runbook_text=runbook_text,
+            )
+            command = build_codex_exec_command(
+                codex_executable,
+                self.base_dir,
+                model=model_name,
+                reasoning_effort="xhigh",
+            )
+            ok, output = self._run_setup_command(command, timeout_seconds=1200, input_text=prompt)
+            if not ok:
+                tail_lines = output.splitlines()[-12:] if output else []
+                tail_text = "\n".join(tail_lines).strip()
+                if not tail_text:
+                    tail_text = "Codex execution failed without output."
+                raise RuntimeError(tail_text)
+
+            success = True
+            message = f"Auto-filled {self._to_relative_path(profile_path)} using {model_name} (xhigh)."
+        except Exception as error:
+            message = str(error)
+
+        self.after(
+            0,
+            lambda: self._on_profile_autofill_completed(
+                success=success,
+                message=message,
+                profile_path=profile_path,
+            ),
+        )
+
+    def _on_profile_autofill_completed(
+        self,
+        *,
+        success: bool,
+        message: str,
+        profile_path: Path,
+    ) -> None:
+        self.profile_autofill_in_progress = False
+        self._sync_auto_fill_profile_button()
+        if self.reload_settings_button is not None and self.current_settings_file_path is not None:
+            self.reload_settings_button.configure(state="normal")
+
+        if success:
+            self.settings_editor_dirty = False
+            if self.current_settings_file_path == profile_path and profile_path.is_file():
+                self._load_settings_file(profile_path)
+            self.settings_status_var.set(message)
+            self.status_var.set(message)
+            return
+
+        if self.save_settings_button is not None and self._is_client_profile_selected():
+            self.save_settings_button.configure(state="normal" if self.settings_editor_dirty else "disabled")
+        self.settings_status_var.set("Auto fill failed. Check status.")
+        self.status_var.set("Profile auto fill failed.")
+        messagebox.showerror("Auto Fill Failed", message, parent=self.settings_window)
 
     def _build_settings_file_lookup_for_mode(self, mode: str) -> tuple[dict[str, Path], str, str]:
         if mode == "general":
@@ -4529,6 +4944,7 @@ class ClientMarkdownViewer(tk.Tk):
             if self.reload_settings_button is not None:
                 self.reload_settings_button.configure(state="disabled")
             self.settings_status_var.set(empty_message)
+            self._sync_auto_fill_profile_button()
             return
 
         selected_key: str | None = None
@@ -4563,6 +4979,7 @@ class ClientMarkdownViewer(tk.Tk):
             self.settings_status_var.set(
                 f"Editing: {self._to_relative_path(self.current_settings_file_path)}"
             )
+        self._sync_auto_fill_profile_button()
 
     def _set_settings_listbox_selection(self, target_key: str) -> None:
         if self.settings_file_listbox is None:
@@ -4804,6 +5221,7 @@ class ClientMarkdownViewer(tk.Tk):
         if self.reload_settings_button is not None:
             self.reload_settings_button.configure(state="normal")
         self.settings_status_var.set(f"Editing: {self._to_relative_path(path)}")
+        self._sync_auto_fill_profile_button()
 
     def _on_settings_editor_modified(self, _event: tk.Event[tk.Misc]) -> None:
         if self.settings_content_text is None:
